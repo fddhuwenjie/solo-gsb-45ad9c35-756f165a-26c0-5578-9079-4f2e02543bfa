@@ -5,6 +5,8 @@
 
 处置复核走 :func:`transaction`：在**同一 SQLite 事务**内重算比对快照、
 校验并写入案件处置行，任一步失败整体回滚（过期快照绝不落库）。
+运输联单同理：同一事务内逐批次重算核对、校验案件归属与处置覆盖后
+才写入不可变联单，任一批次冲突则整体回滚，绝不部分写入。
 """
 
 from __future__ import annotations
@@ -106,6 +108,31 @@ def init_db() -> None:
                 handled_at REAL NOT NULL,
                 note       TEXT,
                 UNIQUE(case_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS waybills (
+                shipment_id  TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                result       TEXT NOT NULL
+                             CHECK (result IN ('released', 'held')),
+                created_at   REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS waybill_batches (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                shipment_id     TEXT NOT NULL
+                                REFERENCES waybills(shipment_id) ON DELETE CASCADE,
+                position        INTEGER NOT NULL,
+                batch_id        TEXT NOT NULL
+                                REFERENCES batches(batch_id),
+                case_id         TEXT NOT NULL
+                                REFERENCES cases(case_id),
+                analysis_digest TEXT NOT NULL,
+                handoff_at      REAL NOT NULL,
+                anomaly_count   INTEGER NOT NULL,
+                case_status     TEXT NOT NULL
+                                CHECK (case_status IN ('open', 'closed')),
+                UNIQUE(shipment_id, position)
             );
             """
         )
@@ -313,4 +340,56 @@ def save_case(
            VALUES (?, ?, ?, ?, ?)""",
         [(case_id, seq, decision, handled_at, note)
          for seq, decision, handled_at, note in decisions],
+    )
+
+
+# ---------- 运输联单 ----------
+
+
+def get_waybill_for_update(
+    conn: sqlite3.Connection, shipment_id: str
+) -> Optional[dict[str, Any]]:
+    """事务内读取联单（含按交接顺序排列的批次行）；不存在返回 None。"""
+    waybill = conn.execute(
+        "SELECT * FROM waybills WHERE shipment_id = ?", (shipment_id,)
+    ).fetchone()
+    if waybill is None:
+        return None
+    rows = conn.execute(
+        "SELECT * FROM waybill_batches WHERE shipment_id = ? ORDER BY position",
+        (shipment_id,),
+    ).fetchall()
+    return {"waybill": dict(waybill), "batches": [dict(r) for r in rows]}
+
+
+def save_waybill(
+    conn: sqlite3.Connection,
+    shipment_id: str,
+    content_hash: str,
+    result: str,
+    batches: list[tuple[int, str, str, str, float, int, str]],
+) -> None:
+    """在给定事务内写入不可变联单及其批次行。
+
+    batches 元素为
+    ``(position, batch_id, case_id, analysis_digest, handoff_at_epoch,
+    anomaly_count, case_status)``。shipment_id 唯一约束冲突会抛
+    IntegrityError，由调用方按幂等/换内容规则处理。
+    """
+    conn.execute(
+        """INSERT INTO waybills (shipment_id, content_hash, result, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (shipment_id, content_hash, result, time.time()),
+    )
+    conn.executemany(
+        """INSERT INTO waybill_batches
+           (shipment_id, position, batch_id, case_id, analysis_digest,
+            handoff_at, anomaly_count, case_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (shipment_id, position, batch_id, case_id, digest,
+             handoff_at, anomaly_count, case_status)
+            for (position, batch_id, case_id, digest,
+                 handoff_at, anomaly_count, case_status) in batches
+        ],
     )

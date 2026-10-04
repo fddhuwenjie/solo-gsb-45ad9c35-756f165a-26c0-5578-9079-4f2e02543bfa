@@ -14,6 +14,9 @@
 - 🔒 处置绑定快照：分析响应携带 `analysis_digest`（重算后异常规范 JSON 的
   SHA-256）；处置复核必须原样回传，服务在同一 SQLite 事务内重算比对，
   快照过期返回 `409`
+- 🚚 运输联单风险快照：按交接顺序汇总各批次异常数与处置状态，同一事务内
+  逐批重算核对摘要、校验案件归属与处置覆盖，任一冲突整体回滚并返回可定位
+  的 `409`；全部通过才保存不可变联单，给出 `released`/`held` 结论
 - 🗄️ SQLite 持久化（WAL 模式），无外部服务依赖
 - 📦 本地依赖：所有 wheel 在 `vendor/` 内，镜像构建**不需要访问外网 PyPI**
 
@@ -32,6 +35,7 @@ docker compose up --build -d
 | http://localhost:8000/api/v1/batches/analyze | 提交分析（POST） |
 | http://localhost:8000/api/v1/batches/{batch_id} | 回放批次结果（GET） |
 | http://localhost:8000/api/v1/cases/review | 处置复核提交（POST） |
+| http://localhost:8000/api/v1/shipments/waybills | 运输联单风险快照（POST） |
 
 停止：`docker compose down`（数据保留在命名卷 `coldchain-data`）。
 
@@ -168,6 +172,12 @@ curl -X POST http://localhost:8000/api/v1/batches/analyze \
 - 并发提交同一批次：SQLite 唯一约束保证只入库一次，其余请求自动重算回放。
 - `GET /api/v1/batches/{batch_id}` 随时回放历史结果（同样重算修正）；不存在返回 `404`。
 
+### 参数校验（422）
+
+- 区段时间重叠、`end <= start`、下限大于上限
+- `dip_tolerance_seconds > gap_seconds`
+- 空采样/空区段、时间戳格式错误等
+
 ## 处置复核（绑定分析快照）
 
 处置接口为 `POST /api/v1/cases/review`。客户端先做分析、拿到
@@ -255,11 +265,95 @@ curl -X POST http://localhost:8000/api/v1/cases/review \
   `handled_at` 早于异常结束、`dismissed` 缺少说明。
 - 批次不存在 → `404`。
 
-### 参数校验（422）
+## 运输联单风险快照
 
-- 区段时间重叠、`end <= start`、下限大于上限
-- `dip_tolerance_seconds > gap_seconds`
-- 空采样/空区段、时间戳格式错误等
+联单接口为 `POST /api/v1/shipments/waybills`。客户端提交 `shipment_id` 及
+**按交接顺序排列**的批次清单（每项含 `batch_id`、`analysis_digest`、`case_id`
+与交接时间 `handoff_at`），服务在**同一 SQLite 事务**内逐项核对：
+
+1. 批次存在（不存在 → `404`，报文定位到具体项）；
+2. 依据保存的原始采样**重算异常**并比对 `analysis_digest`——不一致即批次
+   过期（`409`）；
+3. 案件存在、**属于该批次**、绑定的分析快照与当前重算结果一致，
+   且处置行**恰好覆盖当前全部异常**——案件不匹配或缺少处置均为 `409`；
+4. 全部通过后写入**不可变联单**并提交事务；任一项失败整个事务回滚，
+   **绝不部分写入**（包括前几项重算对旧口径异常行的修正也一并回滚）。
+
+```bash
+# 1) 两个批次分别分析，拿到各自 digest
+D1=$(curl -s -X POST http://localhost:8000/api/v1/batches/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{ "batch_id": "B-100", "device_id": "reefer-A",
+        "samples": [
+          {"timestamp": "2026-09-22T08:01:00Z", "temperature": 10.1},
+          {"timestamp": "2026-09-22T08:03:00Z", "temperature": 10.1}
+        ],
+        "segments": [
+          {"segment_id": "load-1", "segment_type": "loading",
+           "start": "2026-09-22T08:00:00Z", "end": "2026-09-22T08:10:00Z",
+           "lower_limit": 0.0, "upper_limit": 8.0}
+        ] }' | jq -r .analysis_digest)
+D2=$(curl -s -X POST http://localhost:8000/api/v1/batches/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{ "batch_id": "B-200", "device_id": "reefer-B", "samples": [...],
+        "segments": [...] }' | jq -r .analysis_digest)
+
+# 2) 两个批次分别完成处置复核（略，见上一节），得到 CASE-100 / CASE-200
+
+# 3) 按交接顺序组单
+curl -X POST http://localhost:8000/api/v1/shipments/waybills \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"shipment_id\": \"SHIP-900\",
+    \"batches\": [
+      {\"batch_id\": \"B-100\", \"analysis_digest\": \"$D1\",
+       \"case_id\": \"CASE-100\", \"handoff_at\": \"2026-09-22T10:00:00Z\"},
+      {\"batch_id\": \"B-200\", \"analysis_digest\": \"$D2\",
+       \"case_id\": \"CASE-200\", \"handoff_at\": \"2026-09-22T12:00:00Z\"}
+    ]
+  }"
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `shipment_id` | 运输单号；相同单号**同内容幂等回放**，换内容返回 `409` |
+| `batches[]` | 按交接顺序排列的批次清单（至少 1 项）；顺序即交接语义 |
+| `batches[].batch_id` | 分析批次号；联单内不可重复（`422`），不存在返回 `404` |
+| `batches[].analysis_digest` | 该批次分析响应的摘要；与重算结果不一致即批次过期（`409`） |
+| `batches[].case_id` | 该批次异常的处置案件号；必须属于本批次且覆盖当前全部异常 |
+| `batches[].handoff_at` | 本批次交接时间（ISO-8601）；联单内必须**严格递增**（`422`） |
+
+成功响应（按交接顺序给出各批次异常数与处置状态，以及总体结论）：
+
+```json
+{
+  "shipment_id": "SHIP-900",
+  "result": "held",
+  "cached": false,
+  "batches": [
+    {"position": 0, "batch_id": "B-100", "case_id": "CASE-100",
+     "handoff_at": "2026-09-22T10:00:00.000Z",
+     "anomaly_count": 1, "case_status": "closed"},
+    {"position": 1, "batch_id": "B-200", "case_id": "CASE-200",
+     "handoff_at": "2026-09-22T12:00:00.000Z",
+     "anomaly_count": 1, "case_status": "open"}
+  ]
+}
+```
+
+联单语义与错误码：
+
+- **总体结论**：所有批次案件均 `closed` → `"released"`；只要存在一个
+  `open` 案件（含 `accepted` 未闭环）→ `"held"`。
+- **可定位冲突 `409`**：错误报文包含联单项序号与 `batch_id`，指明是哪一项
+  批次过期、案件不匹配或缺少处置；整个事务回滚，联单与批次行均不落库。
+- **换内容 `409`**：相同 `shipment_id` 已存在联单，但清单任一字段（含顺序、
+  案件号、交接时间）与首次提交不同；联单不可变更，仅支持同内容幂等回放
+  （回放响应 `cached: true`、`X-Cache: HIT`，首次提交为 `X-Cache: MISS`）。
+- **请求校验 `422`**：批次清单为空、批次号重复、`handoff_at` 未严格递增。
+- 批次不存在 → `404`（报文同样定位到具体项）。
 
 ## 本地开发（不使用 Docker）
 
@@ -287,11 +381,11 @@ COLDCHAIN_DB=/tmp/test.db .venv/bin/python -m unittest discover -s tests -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、序列化、幂等编排、复核事务
+│   ├── main.py        # FastAPI 路由、序列化、幂等编排、复核/联单事务
 │   ├── detection.py   # 核心检测/合并/拆段/归因算法（纯函数，无 IO）
 │   ├── models.py      # Pydantic 请求/响应模型与时间转换
-│   └── db.py          # SQLite 连接、建表、批次/案件读写与事务
-├── tests/             # unittest 算法与 API 测试（47 个用例，含快照绑定与复核幂等）
+│   └── db.py          # SQLite 连接、建表、批次/案件/联单读写与事务
+├── tests/             # unittest 算法与 API 测试（62 个用例，含快照绑定、复核与联单幂等）
 ├── vendor/            # 本地依赖 wheel（离线安装）
 ├── requirements.txt
 ├── Dockerfile         # pip --no-index 离线安装

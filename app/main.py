@@ -20,6 +20,9 @@ from .models import (
     CaseReviewRequest,
     CaseReviewResponse,
     DecisionOut,
+    WaybillBatchOut,
+    WaybillRequest,
+    WaybillResponse,
     from_epoch,
     to_epoch,
 )
@@ -33,11 +36,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="冷链温区异常归因 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "按装卸/运输区段的温度上下限检测连续越界，容忍短暂回落、"
         "跨采样缺口拆段，并按异常区间内实际采样时刻数量将异常归因到"
         "对应区段；历史回放一律依据保存的原始采样重算，修正旧口径归因。"
+        "处置复核与运输联单在同一 SQLite 事务内重算核对快照，"
+        "联单按交接顺序汇总各批次异常数与处置状态，给出 released/held 结论。"
     ),
     lifespan=lifespan,
 )
@@ -477,3 +482,208 @@ def submit_case_review(req: CaseReviewRequest, response: Response) -> CaseReview
             cached=False,
         )
     return result
+
+
+# ---------- 运输联单风险快照 ----------
+
+
+def _waybill_content_hash(req: WaybillRequest) -> str:
+    """联单请求体（按交接顺序的批次清单，含摘要/案件号/交接时间）的规范化哈希。
+
+    相同 shipment_id 同内容回放必须逐字节一致；清单顺序本身就是交接语义，
+    因此顺序不同即内容不同（409）。
+    """
+    payload = {
+        "batches": [
+            {
+                "batch_id": b.batch_id,
+                "analysis_digest": b.analysis_digest,
+                "case_id": b.case_id,
+                "handoff_at": to_epoch(b.handoff_at),
+            }
+            for b in req.batches
+        ],
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _build_waybill_response(
+    shipment_id: str,
+    result: str,
+    batches: list[WaybillBatchOut],
+    cached: bool,
+) -> WaybillResponse:
+    return WaybillResponse(
+        shipment_id=shipment_id,
+        result=result,  # type: ignore[arg-type]
+        cached=cached,
+        batches=batches,
+    )
+
+
+def _waybill_response_from_stored(
+    stored: dict[str, Any], cached: bool
+) -> WaybillResponse:
+    """已存联单行 → 响应；联单不可变，回放直接读快照，不重算。"""
+    waybill = stored["waybill"]
+    return _build_waybill_response(
+        shipment_id=waybill["shipment_id"],
+        result=waybill["result"],
+        batches=[
+            WaybillBatchOut(
+                position=r["position"],
+                batch_id=r["batch_id"],
+                case_id=r["case_id"],
+                handoff_at=from_epoch(r["handoff_at"]),
+                anomaly_count=r["anomaly_count"],
+                case_status=r["case_status"],
+            )
+            for r in sorted(stored["batches"], key=lambda r: r["position"])
+        ],
+        cached=cached,
+    )
+
+
+@app.post("/api/v1/shipments/waybills", response_model=WaybillResponse)
+def create_waybill(req: WaybillRequest, response: Response) -> WaybillResponse:
+    """提交运输联单风险快照：按交接顺序汇总各批次的异常与处置结论。
+
+    服务在**同一 SQLite 事务**内逐项处理批次清单：依据保存的原始采样
+    重算异常并比对 ``analysis_digest``（不一致即批次过期），确认案件存在、
+    属于该批次、绑定当前快照且处置恰好覆盖当前全部异常；交接时间严格递增、
+    批次不重复在请求层校验。任一批次过期、案件不匹配或缺少处置时整个事务
+    回滚——绝不部分写入——并返回可定位到具体批次的冲突（409）。全部通过
+    后保存不可变联单，按交接顺序返回各批次异常数与处置状态；存在 open
+    案件则总体 ``held``，否则 ``released``。相同 shipment_id 同内容幂等
+    回放，换内容返回 409。
+    """
+    content_hash = _waybill_content_hash(req)
+
+    with db.transaction() as conn:
+        existing = db.get_waybill_for_update(conn, req.shipment_id)
+        if existing is not None:
+            # 相同运输单号：幂等只认同内容；换内容（含换顺序/换案件/换时间）409
+            if existing["waybill"]["content_hash"] != content_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"shipment_id={req.shipment_id} 已存在联单但提交内容不同；"
+                        "联单不可变更，仅支持同内容幂等回放"
+                    ),
+                )
+            response.headers["X-Cache"] = "HIT"
+            return _waybill_response_from_stored(existing, cached=True)
+
+        out_batches: list[WaybillBatchOut] = []
+        rows: list[tuple[int, str, str, str, float, int, str]] = []
+        for position, item in enumerate(req.batches):
+            where = f"联单第 {position} 项（batch_id={item.batch_id}）"
+
+            batch_row = db._select_batch(conn, item.batch_id)
+            if batch_row is None:
+                raise HTTPException(
+                    status_code=404, detail=f"{where}：批次不存在"
+                )
+            stored_batch = {
+                "batch": dict(batch_row),
+                "anomalies": db._select_anomalies(conn, item.batch_id),
+            }
+
+            # 同一事务内依据原始采样重算并比对摘要：批次过期直接 409，
+            # 事务随异常回滚，此前任何批次的重算覆盖都不会落库。
+            _device_id, anomalies = _recompute_batch_conn(conn, stored_batch)
+            current_digest = _analysis_digest(anomalies)
+            if current_digest != item.analysis_digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{where}：analysis_digest 与重算后的当前异常快照"
+                        "不一致，批次已过期，请重新获取分析结果后再组单"
+                    ),
+                )
+
+            case = db.get_case_for_update(conn, item.case_id)
+            if case is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{where}：案件 {item.case_id} 不存在，缺少处置",
+                )
+            case_row = case["case"]
+            if case_row["batch_id"] != item.batch_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{where}：案件 {item.case_id} 属于批次 "
+                        f"{case_row['batch_id']}，案件不匹配"
+                    ),
+                )
+            if case_row["analysis_digest"] != current_digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{where}：案件 {item.case_id} 绑定的分析快照与当前"
+                        "重算结果不一致，案件不匹配"
+                    ),
+                )
+            # 处置必须恰好覆盖当前全部异常（缺一条即缺少处置）
+            expected_seqs = set(range(len(anomalies)))
+            given_seqs = {d["seq"] for d in case["decisions"]}
+            if given_seqs != expected_seqs:
+                missing = sorted(expected_seqs - given_seqs)
+                extra = sorted(given_seqs - expected_seqs)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{where}：案件 {item.case_id} 的处置未覆盖当前全部"
+                        f"异常（缺失序号={missing}，越界序号={extra}），缺少处置"
+                    ),
+                )
+
+            handoff_at = to_epoch(item.handoff_at)
+            case_status = case_row["status"]
+            rows.append(
+                (position, item.batch_id, item.case_id, current_digest,
+                 handoff_at, len(anomalies), case_status)
+            )
+            out_batches.append(
+                WaybillBatchOut(
+                    position=position,
+                    batch_id=item.batch_id,
+                    case_id=item.case_id,
+                    handoff_at=from_epoch(handoff_at),
+                    anomaly_count=len(anomalies),
+                    case_status=case_status,
+                )
+            )
+
+        result = (
+            "held"
+            if any(b.case_status == "open" for b in out_batches)
+            else "released"
+        )
+
+        try:
+            db.save_waybill(
+                conn,
+                shipment_id=req.shipment_id,
+                content_hash=content_hash,
+                result=result,
+                batches=rows,
+            )
+        except sqlite3.IntegrityError as exc:
+            # 并发下联单已被其他内容抢先创建：按内容判定幂等/冲突
+            existing = db.get_waybill_for_update(conn, req.shipment_id)
+            assert existing is not None
+            if existing["waybill"]["content_hash"] != content_hash:
+                raise HTTPException(
+                    status_code=409, detail="运输单号已被其他联单内容占用"
+                ) from exc
+            response.headers["X-Cache"] = "HIT"
+            return _waybill_response_from_stored(existing, cached=True)
+
+        response.headers["X-Cache"] = "MISS"
+        return _build_waybill_response(
+            req.shipment_id, result, out_batches, cached=False
+        )

@@ -190,3 +190,72 @@ class CaseReviewResponse(BaseModel):
     )
     cached: bool = Field(..., description="true 表示相同案件同内容幂等回放")
     decisions: list[DecisionOut]
+
+
+# ---------- 运输联单风险快照 ----------
+
+
+class WaybillItemIn(BaseModel):
+    batch_id: str = Field(..., min_length=1, max_length=128, description="分析批次号")
+    analysis_digest: str = Field(
+        ..., min_length=1,
+        description="分析响应中的 analysis_digest；与服务端重算结果不一致即批次过期（409）",
+    )
+    case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="该批次异常的处置案件号；必须属于本批次且覆盖当前全部异常",
+    )
+    handoff_at: datetime = Field(
+        ..., description="本批次交接时间（ISO-8601）；联单内必须按交接顺序严格递增"
+    )
+
+
+class WaybillRequest(BaseModel):
+    shipment_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="运输单号；相同单号同内容幂等回放，换内容返回 409",
+    )
+    batches: list[WaybillItemIn] = Field(
+        ..., min_length=1, description="按交接顺序排列的批次清单"
+    )
+
+    @model_validator(mode="after")
+    def _validate_handoff_chain(self) -> "WaybillRequest":
+        seen: set[str] = set()
+        prev: Optional[float] = None
+        for index, item in enumerate(self.batches):
+            if item.batch_id in seen:
+                raise ValueError(
+                    f"批次重复: {item.batch_id}（第 {index} 项）；"
+                    "同一批次不得在同一联单中出现两次"
+                )
+            seen.add(item.batch_id)
+            ts = to_epoch(item.handoff_at)
+            if prev is not None and ts <= prev:
+                raise ValueError(
+                    f"handoff_at 必须按交接顺序严格递增：第 {index} 项 "
+                    f"（batch_id={item.batch_id}）不晚于前一项"
+                )
+            prev = ts
+        return self
+
+
+class WaybillBatchOut(BaseModel):
+    position: int = Field(..., description="交接顺序号（从 0 起）")
+    batch_id: str
+    case_id: str
+    handoff_at: str
+    anomaly_count: int = Field(..., description="该批次重算后的异常数")
+    case_status: CaseStatus = Field(..., description="该批次处置案件状态")
+
+
+WaybillResult = Literal["released", "held"]
+
+
+class WaybillResponse(BaseModel):
+    shipment_id: str
+    result: WaybillResult = Field(
+        ..., description="全部批次案件 closed 时 released；存在 open 案件时 held"
+    )
+    cached: bool = Field(..., description="true 表示相同运输单号同内容幂等回放")
+    batches: list[WaybillBatchOut]
