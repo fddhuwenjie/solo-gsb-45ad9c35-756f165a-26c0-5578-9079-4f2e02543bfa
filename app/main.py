@@ -20,6 +20,9 @@ from .models import (
     CaseReviewRequest,
     CaseReviewResponse,
     DecisionOut,
+    ShipmentBatchOut,
+    ShipmentSnapshotRequest,
+    ShipmentSnapshotResponse,
     from_epoch,
     to_epoch,
 )
@@ -33,11 +36,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="冷链温区异常归因 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "按装卸/运输区段的温度上下限检测连续越界，容忍短暂回落、"
         "跨采样缺口拆段，并按异常区间内实际采样时刻数量将异常归因到"
         "对应区段；历史回放一律依据保存的原始采样重算，修正旧口径归因。"
+        "处置复核绑定分析快照；运输联单在同一事务内逐批次核对快照与案件"
+        "处置后落库，给出 released/held 风险结论。"
     ),
     lifespan=lifespan,
 )
@@ -477,3 +482,202 @@ def submit_case_review(req: CaseReviewRequest, response: Response) -> CaseReview
             cached=False,
         )
     return result
+
+
+# ---------- 运输联单风险快照 ----------
+
+
+def _shipment_content_hash(req: ShipmentSnapshotRequest) -> str:
+    """联单内容（按交接顺序的批次清单）的规范化哈希。
+
+    清单顺序本身即联单内容：相同 shipment_id 只有逐字节一致才幂等回放，
+    换内容（含换顺序、换案件、换摘要、换交接时间）返回 409。
+    """
+    payload = {
+        "shipment_id": req.shipment_id,
+        "batches": [
+            {
+                "batch_id": b.batch_id,
+                "analysis_digest": b.analysis_digest,
+                "case_id": b.case_id,
+                "handoff_at": to_epoch(b.handoff_at),
+            }
+            for b in req.batches
+        ],
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _build_shipment_response(
+    ship: dict[str, Any],
+    rows: list[dict[str, Any]],
+    cached: bool,
+) -> ShipmentSnapshotResponse:
+    return ShipmentSnapshotResponse(
+        shipment_id=ship["shipment_id"],
+        cached=cached,
+        result=ship["result"],
+        batches=[
+            ShipmentBatchOut(
+                seq=r["seq"],
+                batch_id=r["batch_id"],
+                case_id=r["case_id"],
+                analysis_digest=r["analysis_digest"],
+                handoff_at=from_epoch(r["handoff_at"]),
+                anomaly_count=r["anomaly_count"],
+                case_status=r["case_status"],
+            )
+            for r in sorted(rows, key=lambda r: r["seq"])
+        ],
+    )
+
+
+@app.post("/api/v1/shipments/snapshot", response_model=ShipmentSnapshotResponse)
+def create_shipment_snapshot(
+    req: ShipmentSnapshotRequest, response: Response
+) -> ShipmentSnapshotResponse:
+    """提交运输联单风险快照；全部批次校验通过后在同一事务内落库。
+
+    服务在**同一 SQLite 事务**内对清单中每个批次：依据保存的原始采样重算
+    异常并核对 ``analysis_digest``（过期即 409）→ 核对案件存在、属于该批次、
+    处置依据当前快照且覆盖全部当前异常（缺失/不匹配即 409）。交接时间严格
+    递增与批次不重复在请求模型层校验（422）。任一批次未通过校验时整个事务
+    回滚，绝不部分写入，错误详情可定位到具体清单项。
+
+    全部通过后保存不可变联单，按交接顺序返回各批次异常数与案件状态；存在
+    open 案件时总体结果为 held，否则 released。相同 shipment_id 同内容幂等
+    回放；换内容返回 409。
+    """
+    content_hash = _shipment_content_hash(req)
+
+    with db.transaction() as conn:
+        existing = db.get_shipment_for_update(conn, req.shipment_id)
+        if existing is not None:
+            # 相同联单号：幂等只认同内容；换内容 409（联单不可变更）
+            if existing["shipment"]["content_hash"] != content_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"shipment_id={req.shipment_id} 已存在但提交内容不同；"
+                        "联单不可变更，仅支持同内容幂等回放"
+                    ),
+                )
+            response.headers["X-Cache"] = "HIT"
+            return _build_shipment_response(
+                existing["shipment"], existing["batches"], cached=True
+            )
+
+        items: list[tuple[int, str, str, str, float, int, str]] = []
+        any_open = False
+        for index, item in enumerate(req.batches):
+            pos = f"联单第 {index + 1} 项（batch_id={item.batch_id}）"
+            batch_row = db._select_batch(conn, item.batch_id)
+            if batch_row is None:
+                raise HTTPException(
+                    status_code=404, detail=f"{pos} 不存在，请先提交分析"
+                )
+            stored_batch = {
+                "batch": dict(batch_row),
+                "anomalies": db._select_anomalies(conn, item.batch_id),
+            }
+
+            # 重算并在同一事务内比对摘要：批次过期直接 409（事务随异常回滚，
+            # 旧口径行的重算覆盖也不会落库）。
+            _device_id, anomalies = _recompute_batch_conn(conn, stored_batch)
+            current_digest = _analysis_digest(anomalies)
+            if current_digest != item.analysis_digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{pos} 的 analysis_digest 与重算后的当前异常快照"
+                        "不一致；批次快照已过期，请重新获取分析结果"
+                    ),
+                )
+
+            case = db.get_case_for_update(conn, item.case_id)
+            if case is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{pos} 缺少处置：案件 case_id={item.case_id} 不存在，"
+                        "请先提交处置复核"
+                    ),
+                )
+            case_row = case["case"]
+            if case_row["batch_id"] != item.batch_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{pos} 的案件 case_id={item.case_id} 实际属于批次 "
+                        f"{case_row['batch_id']}，案件与批次不匹配"
+                    ),
+                )
+            if case_row["analysis_digest"] != current_digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{pos} 的案件 case_id={item.case_id} 处置依据的快照"
+                        "与当前异常不一致，未覆盖当前异常"
+                    ),
+                )
+            covered = {d["seq"] for d in case["decisions"]}
+            if covered != set(range(len(anomalies))):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{pos} 的案件 case_id={item.case_id} 处置未覆盖当前"
+                        f"全部异常（共 {len(anomalies)} 条）"
+                    ),
+                )
+
+            if case_row["status"] == "open":
+                any_open = True
+            items.append(
+                (
+                    index,
+                    item.batch_id,
+                    item.case_id,
+                    current_digest,
+                    to_epoch(item.handoff_at),
+                    len(anomalies),
+                    case_row["status"],
+                )
+            )
+
+        result = "held" if any_open else "released"
+        try:
+            db.save_shipment(conn, req.shipment_id, content_hash, result, items)
+        except sqlite3.IntegrityError as exc:
+            # 并发下联单已被其他内容抢先创建：按内容判定幂等/冲突
+            existing = db.get_shipment_for_update(conn, req.shipment_id)
+            assert existing is not None
+            if existing["shipment"]["content_hash"] != content_hash:
+                raise HTTPException(
+                    status_code=409, detail="联单号已被其他内容占用"
+                ) from exc
+            response.headers["X-Cache"] = "HIT"
+            return _build_shipment_response(
+                existing["shipment"], existing["batches"], cached=True
+            )
+
+        response.headers["X-Cache"] = "MISS"
+        result_body = _build_shipment_response(
+            {"shipment_id": req.shipment_id, "result": result},
+            [
+                {
+                    "seq": seq,
+                    "batch_id": batch_id,
+                    "case_id": case_id,
+                    "analysis_digest": digest,
+                    "handoff_at": handoff_at,
+                    "anomaly_count": anomaly_count,
+                    "case_status": case_status,
+                }
+                for seq, batch_id, case_id, digest, handoff_at,
+                anomaly_count, case_status in items
+            ],
+            cached=False,
+        )
+    return result_body

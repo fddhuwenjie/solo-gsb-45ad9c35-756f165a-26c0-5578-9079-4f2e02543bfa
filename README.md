@@ -14,6 +14,10 @@
 - 🔒 处置绑定快照：分析响应携带 `analysis_digest`（重算后异常规范 JSON 的
   SHA-256）；处置复核必须原样回传，服务在同一 SQLite 事务内重算比对，
   快照过期返回 `409`
+- 🧾 运输联单风险快照：按交接顺序提交批次清单（批次 + 摘要 + 案件 + 交接
+  时间），服务在同一事务内逐批次重算核对快照、确认案件覆盖当前异常，
+  全部通过才落库不可变联单，给出 `released`/`held` 结论；存在 open 案件
+  即 held
 - 🗄️ SQLite 持久化（WAL 模式），无外部服务依赖
 - 📦 本地依赖：所有 wheel 在 `vendor/` 内，镜像构建**不需要访问外网 PyPI**
 
@@ -32,6 +36,7 @@ docker compose up --build -d
 | http://localhost:8000/api/v1/batches/analyze | 提交分析（POST） |
 | http://localhost:8000/api/v1/batches/{batch_id} | 回放批次结果（GET） |
 | http://localhost:8000/api/v1/cases/review | 处置复核提交（POST） |
+| http://localhost:8000/api/v1/shipments/snapshot | 运输联单风险快照（POST） |
 
 停止：`docker compose down`（数据保留在命名卷 `coldchain-data`）。
 
@@ -255,7 +260,96 @@ curl -X POST http://localhost:8000/api/v1/cases/review \
   `handled_at` 早于异常结束、`dismissed` 缺少说明。
 - 批次不存在 → `404`。
 
-### 参数校验（422）
+## 运输联单风险快照
+
+联单接口为 `POST /api/v1/shipments/snapshot`。客户端按**交接顺序**提交批次
+清单，每项给出 `batch_id`、`analysis_digest`（该批次当前分析快照）、
+`case_id`（覆盖该批次全部当前异常的处置案件）与 `handoff_at`（交接时间）。
+服务在**同一 SQLite 事务**内逐批次校验：依据保存的原始采样重算异常并核对
+摘要 → 确认案件存在、属于该批次、处置依据当前快照且覆盖全部当前异常。
+任一项未通过则整个事务回滚、绝不部分写入，错误详情可定位到具体清单项；
+全部通过后保存**不可变联单**，按交接顺序返回各批次异常数与案件状态，并
+给出总体结果：存在 open 案件为 `held`，否则 `released`。
+
+```bash
+# 1) 两个批次分别分析，拿到各自 digest（此处用 shell 变量代指）
+DIGEST_A=$(curl -s -X POST http://localhost:8000/api/v1/batches/analyze \
+  -H 'Content-Type: application/json' -d @batch-a.json | jq -r .analysis_digest)
+DIGEST_B=$(curl -s -X POST http://localhost:8000/api/v1/batches/analyze \
+  -H 'Content-Type: application/json' -d @batch-b.json | jq -r .analysis_digest)
+
+# 2) 两个批次分别完成处置复核（略，见上一节；假设案件 CASE-A 已 closed、
+#    CASE-B 含 accepted 仍为 open）
+
+# 3) 提交运输联单风险快照（handoff_at 必须按清单顺序严格递增）
+curl -X POST http://localhost:8000/api/v1/shipments/snapshot \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"shipment_id\": \"SHP-2026-09-22-01\",
+    \"batches\": [
+      {\"batch_id\": \"TRIP-001\", \"analysis_digest\": \"$DIGEST_A\",
+       \"case_id\": \"CASE-A\", \"handoff_at\": \"2026-09-22T10:00:00Z\"},
+      {\"batch_id\": \"TRIP-002\", \"analysis_digest\": \"$DIGEST_B\",
+       \"case_id\": \"CASE-B\", \"handoff_at\": \"2026-09-22T14:00:00Z\"}
+    ]
+  }"
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `shipment_id` | 运输联单号；相同联单号**同内容幂等回放**，换内容返回 `409` |
+| `batches[]` | 按交接顺序排列的批次清单（至少 1 项）；`batch_id` 不可重复 |
+| `batches[].batch_id` | 已分析批次号；不存在返回 `404` |
+| `batches[].analysis_digest` | 该批次当前分析摘要；与事务内重算结果不一致返回 `409`（批次过期） |
+| `batches[].case_id` | 该批次处置案件号；案件缺失、属于其他批次、依据过期快照或未覆盖当前全部异常均返回 `409` |
+| `batches[].handoff_at` | 交接时间（ISO-8601）；清单内必须**严格递增**，否则 `422` |
+
+成功响应（CASE-B 为 open → 总体 `held`）：
+
+```json
+{
+  "shipment_id": "SHP-2026-09-22-01",
+  "cached": false,
+  "result": "held",
+  "batches": [
+    {
+      "seq": 0,
+      "batch_id": "TRIP-001",
+      "case_id": "CASE-A",
+      "analysis_digest": "a1f9…",
+      "handoff_at": "2026-09-22T10:00:00.000Z",
+      "anomaly_count": 1,
+      "case_status": "closed"
+    },
+    {
+      "seq": 1,
+      "batch_id": "TRIP-002",
+      "case_id": "CASE-B",
+      "analysis_digest": "b7e2…",
+      "handoff_at": "2026-09-22T14:00:00.000Z",
+      "anomaly_count": 2,
+      "case_status": "open"
+    }
+  ]
+}
+```
+
+联单语义与错误码：
+
+- **总体结果**：全部案件 `closed` → `"released"`；存在 `open` 案件 → `"held"`。
+- **批次过期 `409`**：某项 `analysis_digest` 与同一事务内重算出的当前摘要
+  不一致；事务回滚，联单与批次行均不落库。请重新获取分析结果后再提交。
+- **案件问题 `409`**：案件不存在（缺少处置）、案件属于其他批次、案件处置
+  依据的摘要与当前快照不一致、或处置未覆盖当前全部异常。
+- **换内容 `409`**：相同 `shipment_id` 已存在，但清单任一项（含顺序、案件、
+  摘要、交接时间）与首次提交不同；联单不可变更，仅支持同内容幂等回放
+  （回放响应 `cached: true`、`X-Cache: HIT`，首次提交为 `X-Cache: MISS`）。
+- **结构校验 `422`**：清单为空、`batch_id` 重复、`handoff_at` 未严格递增。
+- 批次不存在 → `404`（详情指明出问题的清单项）。
+
+## 参数校验（422，分析请求）
 
 - 区段时间重叠、`end <= start`、下限大于上限
 - `dip_tolerance_seconds > gap_seconds`
@@ -287,11 +381,11 @@ COLDCHAIN_DB=/tmp/test.db .venv/bin/python -m unittest discover -s tests -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、序列化、幂等编排、复核事务
+│   ├── main.py        # FastAPI 路由、序列化、幂等编排、复核/联单事务
 │   ├── detection.py   # 核心检测/合并/拆段/归因算法（纯函数，无 IO）
 │   ├── models.py      # Pydantic 请求/响应模型与时间转换
-│   └── db.py          # SQLite 连接、建表、批次/案件读写与事务
-├── tests/             # unittest 算法与 API 测试（47 个用例，含快照绑定与复核幂等）
+│   └── db.py          # SQLite 连接、建表、批次/案件/联单读写与事务
+├── tests/             # unittest 算法与 API 测试（63 个用例，含快照绑定、复核与联单幂等）
 ├── vendor/            # 本地依赖 wheel（离线安装）
 ├── requirements.txt
 ├── Dockerfile         # pip --no-index 离线安装

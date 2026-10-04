@@ -190,3 +190,68 @@ class CaseReviewResponse(BaseModel):
     )
     cached: bool = Field(..., description="true 表示相同案件同内容幂等回放")
     decisions: list[DecisionOut]
+
+
+# ---------- 运输联单风险快照 ----------
+
+
+class WaybillItemIn(BaseModel):
+    batch_id: str = Field(..., min_length=1, max_length=128, description="分析批次号")
+    analysis_digest: str = Field(
+        ..., min_length=1, description="该批次分析响应中的 analysis_digest，绑定当前异常快照"
+    )
+    case_id: str = Field(
+        ..., min_length=1, max_length=128, description="覆盖该批次全部当前异常的处置案件号"
+    )
+    handoff_at: datetime = Field(
+        ..., description="该批次交接时间；联单内必须按交接顺序严格递增"
+    )
+
+
+class ShipmentSnapshotRequest(BaseModel):
+    shipment_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="运输联单号；相同联单号同内容幂等回放，换内容返回 409",
+    )
+    batches: list[WaybillItemIn] = Field(
+        ..., min_length=1, description="按交接顺序排列的批次清单；批次不可重复"
+    )
+
+    @model_validator(mode="after")
+    def _validate_handoff_order(self) -> "ShipmentSnapshotRequest":
+        seen: set[str] = set()
+        prev: Optional[float] = None
+        for index, item in enumerate(self.batches):
+            if item.batch_id in seen:
+                raise ValueError(f"batches 中 batch_id 重复: {item.batch_id}")
+            seen.add(item.batch_id)
+            ts = to_epoch(item.handoff_at)
+            if prev is not None and ts <= prev:
+                raise ValueError(
+                    f"batches[{index}] 的 handoff_at 必须晚于前一批次"
+                    "（交接时间按清单顺序严格递增）"
+                )
+            prev = ts
+        return self
+
+
+class ShipmentBatchOut(BaseModel):
+    seq: int = Field(..., description="联单内交接序号（从 0 起，与提交顺序一致）")
+    batch_id: str
+    case_id: str
+    analysis_digest: str
+    handoff_at: str
+    anomaly_count: int = Field(..., description="该批次重算后的当前异常数")
+    case_status: CaseStatus = Field(..., description="该批次处置案件状态")
+
+
+ShipmentResult = Literal["released", "held"]
+
+
+class ShipmentSnapshotResponse(BaseModel):
+    shipment_id: str
+    cached: bool = Field(..., description="true 表示相同联单同内容幂等回放")
+    result: ShipmentResult = Field(
+        ..., description="总体结果：全部案件 closed 为 released；存在 open 案件为 held"
+    )
+    batches: list[ShipmentBatchOut]
